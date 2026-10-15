@@ -474,3 +474,12 @@ Forks and modified versions must remove them.
 ## Star history
 
 [![Star History Chart](https://api.star-history.com/svg?repos=storytold/filmcraft&type=Date&legend=top-left)](https://www.star-history.com/?repos=storytold%2Ffilmcraft&type=date&legend=top-left)
+
+## Linux window controls
+
+Linux desktop builds enable winit's Adwaita client-side frame on GNOME/Wayland,
+where the compositor does not provide server-side decorations. Its minimize,
+maximize/restore and close icons are drawn as vectors, so the close button does
+not depend on a font containing a particular character. The frame follows the
+desktop's button layout; X11 and compositors offering server-side decorations
+keep their window manager's frame.
