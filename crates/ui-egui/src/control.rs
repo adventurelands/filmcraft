@@ -96,6 +96,21 @@ fn point(app: &FilmcraftApp, p: &Value) -> Result<egui::Pos2, String> {
     Ok(egui::pos2(x as f32, y as f32))
 }
 
+/// How long an input or screenshot request waits for a `ui` pass before the window counts as not
+/// drawn. A hidden window never draws, so this only has to outlast the slowest frame of a visible
+/// one. Wall-clock time, so the wait doesn't depend on passes running.
+pub(crate) const NOT_DRAWN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The reply to a request that needs a drawn frame while the window isn't drawn.
+pub(crate) const NOT_DRAWN_ERROR: &str = "the window is not being drawn (on another workspace or covered): \
+synthetic input and screenshots need it on screen; engine and inspect requests still work. The request was not run";
+
+/// Requests that only complete in a drawn frame: synthetic input runs in `ui` passes and a
+/// screenshot needs a presented frame.
+pub(crate) fn needs_drawn_frame(method: &str) -> bool {
+    matches!(method, "ui.click" | "ui.move" | "ui.drag" | "ui.scroll" | "ui.key" | "ui.type" | "ui.screenshot")
+}
+
 pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
     let p = &req.params;
     let s = |k: &str| p.get(k).and_then(Value::as_str);
@@ -619,6 +634,19 @@ pub fn encode_png(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
     chunk(&mut out, b"IDAT", &z);
     chunk(&mut out, b"IEND", &[]);
     Ok(out)
+}
+
+#[cfg(test)]
+mod drawn_frame_tests {
+    #[test]
+    fn only_input_and_screenshots_need_a_drawn_frame() {
+        for m in ["ui.click", "ui.move", "ui.drag", "ui.scroll", "ui.key", "ui.type", "ui.screenshot"] {
+            assert!(super::needs_drawn_frame(m), "{m}");
+        }
+        for m in ["engine.execute", "ui.inspect", "ui.elements", "ui.set", "app.quit", ""] {
+            assert!(!super::needs_drawn_frame(m), "{m}");
+        }
+    }
 }
 
 #[cfg(test)]

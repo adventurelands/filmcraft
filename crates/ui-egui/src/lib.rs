@@ -300,6 +300,11 @@ pub struct FilmcraftApp {
     synthetic_modifiers: egui::Modifiers,
     /// Requests waiting for the UI to show an element: (request, give-up time).
     deferred: Vec<(ControlRequest, f64)>,
+    /// Input and screenshot requests waiting to see a `ui` pass: (request, when it came in,
+    /// `ui_passes` then).
+    awaiting_frame: Vec<(ControlRequest, std::time::Instant, u64)>,
+    /// `ui` passes so far, to tell whether one ran since a request came in.
+    ui_passes: u64,
     last_ui_time: f64,
     pub(crate) synthetic: Vec<egui::Event>,
     /// macOS: a Control+Click already translated to a secondary (context) click, so its release is
@@ -561,6 +566,8 @@ impl FilmcraftApp {
             native_window_focused: None,
             synthetic_modifiers: egui::Modifiers::NONE,
             deferred: Vec::new(),
+            awaiting_frame: Vec::new(),
+            ui_passes: 0,
             last_ui_time: 0.0,
             synthetic: Vec::new(),
             mac_ctrl_click_armed: false,
@@ -1585,13 +1592,33 @@ impl FilmcraftApp {
         let Some(rx) = self.control_rx.take() else { return };
         let now = ctx.input(|i| i.time);
         let mut reqs: Vec<(ControlRequest, f64)> = std::mem::take(&mut self.deferred);
+        // Input and screenshots need a drawn frame: each goes ahead once a `ui` pass has run
+        // since it came in. A window the compositor isn't drawing (a Wayland window on another
+        // workspace or under a fullscreen one) runs only eframe's logic-only passes, so after
+        // `NOT_DRAWN` without one the request is answered with why instead of timing out.
+        for (req, since, passes) in std::mem::take(&mut self.awaiting_frame) {
+            if self.ui_passes != passes {
+                reqs.push((req, now + 3.0));
+            } else if since.elapsed() >= control::NOT_DRAWN {
+                let _ = req.reply.send(json!({"ok": false, "error": control::NOT_DRAWN_ERROR}));
+            } else {
+                self.awaiting_frame.push((req, since, passes));
+            }
+        }
         while let Ok(req) = rx.try_recv() {
             // UI requests need rendered frames: raise the window if `ui` hasn't run recently
             // (occluded macOS windows stop running `ui`).
             if req.method.starts_with("ui.") && now - self.last_ui_time > 0.25 {
                 self.raise_for_control(ctx);
             }
-            reqs.push((req, now + 3.0));
+            if control::needs_drawn_frame(&req.method) {
+                self.awaiting_frame.push((req, std::time::Instant::now(), self.ui_passes));
+            } else {
+                reqs.push((req, now + 3.0));
+            }
+        }
+        if !self.awaiting_frame.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         for (req, deadline) in reqs {
             let reply = req.reply.clone();
@@ -2115,6 +2142,7 @@ impl eframe::App for FilmcraftApp {
         }
         let ctx = ui.ctx().clone();
         self.last_ui_time = ctx.input(|i| i.time);
+        self.ui_passes = self.ui_passes.wrapping_add(1);
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
         } else if !self.input_waiters.is_empty() {
