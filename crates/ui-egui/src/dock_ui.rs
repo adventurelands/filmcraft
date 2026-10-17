@@ -294,7 +294,8 @@ impl FilmcraftApp {
             let compact = floating.panels.len() == 1 && panel.compact();
             let header = if compact { 8.0 } else { t.tab_h };
             let strip = Rect::from_min_size(rect.min, vec2(rect.width(), header));
-            let response = ui.interact(strip, id.with("move"), Sense::drag());
+            // Not `id.with("move")`: the `Area` already interacts with that id itself.
+            let response = ui.interact(strip, id.with("header"), Sense::drag());
             self.auto.add_response(&format!("panel.float.{index}.move"), &response, "Move floating panel");
             let mut next = if response.dragged() { rect.translate(response.drag_delta()) } else { rect };
             let group = Group {
