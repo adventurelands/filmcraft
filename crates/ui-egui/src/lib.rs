@@ -61,8 +61,8 @@ mod theme_favorites;
 pub mod widgets;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use egui::{TextureHandle, TextureOptions};
 use filmcraft_engine::{Services, Session};
@@ -318,6 +318,8 @@ pub struct FilmcraftApp {
     /// Screenshots waiting for their frame: (token, path, crop, reply, give-up time).
     pending_screenshots: Vec<(u64, Option<String>, Option<[f32; 4]>, Sender<Value>, f64)>,
     queued_screenshots: Vec<(u64, f64, u32)>,
+    /// Screenshots the backend has taken, by token, until `collect_screenshots` hands them out.
+    taken_screenshots: Arc<Mutex<Vec<(u64, Arc<egui::ColorImage>)>>>,
     /// A paused monitor drew a stand-in (nearest cached) picture last frame: its exact frame is
     /// still decoding.
     pub(crate) monitor_inexact: bool,
@@ -566,6 +568,7 @@ impl FilmcraftApp {
             loudness: None,
             status_seen: (String::new(), 0.0),
             pending_screenshots: Vec::new(),
+            taken_screenshots: Arc::default(),
             queued_screenshots: Vec::new(),
             monitor_inexact: false,
             monitor_asked: HashMap::new(),
@@ -1627,7 +1630,11 @@ impl FilmcraftApp {
             *frames += 1;
             any = true;
             if now >= *at && *frames >= 3 && (settled || now >= *at + SCREENSHOT_SETTLE_MAX_S) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(*token)));
+                let (token, taken, repaint) = (*token, Arc::clone(&self.taken_screenshots), ctx.clone());
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |image| {
+                    taken.lock().unwrap_or_else(PoisonError::into_inner).push((token, image));
+                    repaint.request_repaint();
+                })));
                 false
             } else {
                 true
@@ -1654,20 +1661,8 @@ impl FilmcraftApp {
         if self.pending_screenshots.is_empty() {
             return;
         }
-        let events: Vec<_> = ctx.input(|i| {
-            i.raw
-                .events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::Screenshot { user_data, image, .. } => {
-                        let token = user_data.data.as_ref().and_then(|d| d.downcast_ref::<u64>()).copied()?;
-                        Some((token, image.clone()))
-                    }
-                    _ => None,
-                })
-                .collect()
-        });
-        for (token, image) in events {
+        let taken = std::mem::take(&mut *self.taken_screenshots.lock().unwrap_or_else(PoisonError::into_inner));
+        for (token, image) in taken {
             if let Some(i) = self.pending_screenshots.iter().position(|(t, ..)| *t == token) {
                 let (_, path, crop, reply, _) = self.pending_screenshots.remove(i);
                 let r = control::save_screenshot(ctx, &image, path.as_deref(), crop);
@@ -1696,7 +1691,7 @@ impl FilmcraftApp {
         }
         let media = &self.session.prefs.media;
         let (on, every) = (media.refresh_growing_files, f64::from(media.growing_refresh_seconds.max(1)));
-        let (last_key, focus_key) = (egui::Id::new("mediaWatch.lastScan"), egui::Id::new("mediaWatch.focused"));
+        let (last_key, focus_key) = (egui::Id::unique("mediaWatch.lastScan"), egui::Id::unique("mediaWatch.focused"));
         let now = ctx.input(|i| i.time);
         let focused = ctx.input(|i| i.focused);
         let was_focused: bool = ctx.data(|d| d.get_temp(focus_key)).unwrap_or(focused);
@@ -1812,7 +1807,7 @@ impl FilmcraftApp {
         }
         let hint = if !self.ui.status.is_empty() { self.ui.status.clone() } else { self.hint_text() };
         ui.painter().text(egui::pos2(sb.min.x + 10.0, sb.center().y), egui::Align2::LEFT_CENTER, hint, Tokens::ui(11.0), t.text_dim);
-        let resp = ui.interact(sb, egui::Id::new("status-bar"), egui::Sense::click());
+        let resp = ui.interact(sb, egui::Id::unique("status-bar"), egui::Sense::click());
         if resp.clicked() {
             self.ui.status.clear();
         }
@@ -1865,7 +1860,7 @@ impl FilmcraftApp {
             Tokens::ui(11.0),
             t.text_dim,
         );
-        let resp = ui.interact(cancel, egui::Id::new(("job-cancel", job.id)), egui::Sense::click());
+        let resp = ui.interact(cancel, egui::Id::unique(("job-cancel", job.id)), egui::Sense::click());
         let c = if resp.hovered() { t.hot_text } else { t.text_dim };
         let k = 3.5;
         p.line_segment([cancel.center() - egui::vec2(k, k), cancel.center() + egui::vec2(k, k)], egui::Stroke::new(1.4, c));
@@ -1934,7 +1929,7 @@ impl FilmcraftApp {
         let Some(msg) = self.ui_error.clone() else { return };
         let mut close = false;
         egui::Window::new(tl!("FilmCraft hit an error"))
-            .id(egui::Id::new("FilmCraft hit an error"))
+            .id(egui::Id::unique("FilmCraft hit an error"))
             .collapsible(false)
             .resizable(false)
             .pivot(egui::Align2::CENTER_CENTER)
@@ -2004,8 +1999,9 @@ impl eframe::App for FilmcraftApp {
             synthesize_mac_ctrl_click(&mut self.mac_ctrl_click_armed, raw_input);
         }
         if self.control_input_only {
-            // Preserve screenshot responses and all viewport lifecycle/geometry metadata.
-            raw_input.events.retain(|event| matches!(event, egui::Event::Screenshot { .. }));
+            // Viewport lifecycle and geometry live in `raw_input.viewports`, and screenshots
+            // arrive through their callbacks, so no native event is needed.
+            raw_input.events.clear();
             raw_input.hovered_files.clear();
             raw_input.dropped_files.clear();
         }

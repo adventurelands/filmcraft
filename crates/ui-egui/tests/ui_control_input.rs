@@ -108,7 +108,7 @@ fn background_divider(isolated: bool) {
     d.frames(3, true);
     let before_project = d.h.state().session.project.clone();
     let before_playheads = d.h.state().session.state.playheads.clone();
-    let divider = Id::new(("dock-gutter", String::new()));
+    let divider = Id::unique(("dock-gutter", String::new()));
     d.h.ctx.memory_mut(|memory| memory.request_focus(divider));
     d.frames(2, true);
     d.h.input_mut().events.push(Event::WindowFocused(false));
@@ -150,21 +150,13 @@ fn native_menu_commands_cannot_contaminate_control_only_validation() {
 }
 
 #[test]
-fn isolation_preserves_close_and_screenshot_delivery_without_claiming_os_focus() {
+fn isolation_preserves_close_without_claiming_os_focus() {
     let mut d = Driver::new(true);
     let mut raw = egui::RawInput { focused: false, ..Default::default() };
     let viewport = raw.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
     viewport.focused = Some(false);
     viewport.events.push(egui::ViewportEvent::Close);
-    raw.events = vec![
-        Event::Text("unrelated typing".into()),
-        Event::WindowFocused(false),
-        Event::Screenshot {
-            viewport_id: egui::ViewportId::ROOT,
-            user_data: Default::default(),
-            image: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE])),
-        },
-    ];
+    raw.events = vec![Event::Text("unrelated typing".into()), Event::WindowFocused(false)];
     raw.hovered_files.push(Default::default());
     #[derive(Debug)]
     struct UnrelatedFile;
@@ -187,7 +179,7 @@ fn isolation_preserves_close_and_screenshot_delivery_without_claiming_os_focus()
     assert!(raw.focused);
     assert_eq!(raw.viewports[&egui::ViewportId::ROOT].focused, Some(false));
     assert_eq!(raw.viewports[&egui::ViewportId::ROOT].events, vec![egui::ViewportEvent::Close]);
-    assert!(matches!(raw.events.as_slice(), [Event::Screenshot { .. }, Event::ModifiersChanged(Modifiers::NONE)]));
+    assert!(matches!(raw.events.as_slice(), [Event::ModifiersChanged(Modifiers::NONE)]));
     assert!(raw.hovered_files.is_empty() && raw.dropped_files.is_empty());
     let state = filmcraft_ui_egui::control::inspect(d.h.state(), &ctx);
     assert_eq!(state["input"]["nativeWindowFocused"], false);
