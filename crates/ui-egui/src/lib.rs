@@ -302,7 +302,7 @@ pub struct FilmcraftApp {
     deferred: Vec<(ControlRequest, f64)>,
     /// Input and screenshot requests waiting to see a `ui` pass: (request, when it came in,
     /// `ui_passes` then).
-    awaiting_frame: Vec<(ControlRequest, std::time::Instant, u64)>,
+    awaiting_frame: Vec<(ControlRequest, web_time::Instant, u64)>,
     /// `ui` passes so far, to tell whether one ran since a request came in.
     ui_passes: u64,
     last_ui_time: f64,
@@ -336,7 +336,9 @@ pub struct FilmcraftApp {
     /// Consecutive frames the timeline zoom / scroll has been at rest. `ui.elements` answers from
     /// the frame before the last one, so its timeline rects are final from 2 on.
     pub(crate) timeline_still: u32,
-    input_waiters: Vec<Sender<Value>>,
+    /// Replies for synthetic input, sent once a drawn pass has run it; each with the last time a
+    /// drawn pass worked on the input, so a window that stops drawing gets the reason instead.
+    input_waiters: Vec<(Sender<Value>, web_time::Instant)>,
     next_token: u64,
     styled: bool,
     /// A panic in the UI pass, shown in an error window until dismissed (see [`crash`]).
@@ -1597,12 +1599,12 @@ impl FilmcraftApp {
         // workspace or under a fullscreen one) runs only eframe's logic-only passes, so after
         // `NOT_DRAWN` without one the request is answered with why instead of timing out.
         for (req, since, passes) in std::mem::take(&mut self.awaiting_frame) {
-            if self.ui_passes != passes {
-                reqs.push((req, now + 3.0));
-            } else if since.elapsed() >= control::NOT_DRAWN {
-                let _ = req.reply.send(json!({"ok": false, "error": control::NOT_DRAWN_ERROR}));
-            } else {
-                self.awaiting_frame.push((req, since, passes));
+            match control::await_frame(self.ui_passes, passes, since.elapsed()) {
+                control::AwaitFrame::Release => reqs.push((req, now + 3.0)),
+                control::AwaitFrame::NotDrawn => {
+                    let _ = req.reply.send(json!({"ok": false, "error": control::NOT_DRAWN_ERROR}));
+                }
+                control::AwaitFrame::Wait => self.awaiting_frame.push((req, since, passes)),
             }
         }
         while let Ok(req) = rx.try_recv() {
@@ -1612,7 +1614,7 @@ impl FilmcraftApp {
                 self.raise_for_control(ctx);
             }
             if control::needs_drawn_frame(&req.method) {
-                self.awaiting_frame.push((req, std::time::Instant::now(), self.ui_passes));
+                self.awaiting_frame.push((req, web_time::Instant::now(), self.ui_passes));
             } else {
                 reqs.push((req, now + 3.0));
             }
@@ -1634,7 +1636,7 @@ impl FilmcraftApp {
                         let _ = reply.send(json!({"ok": false, "error": msg}));
                     }
                 }
-                control::Outcome::AfterInput => self.input_waiters.push(reply),
+                control::Outcome::AfterInput => self.input_waiters.push((reply, web_time::Instant::now())),
                 control::Outcome::Screenshot { path, crop } => {
                     let token = self.next_token;
                     self.next_token += 1;
@@ -1685,9 +1687,8 @@ impl FilmcraftApp {
     }
 
     fn collect_screenshots(&mut self, ctx: &egui::Context) {
-        if self.pending_screenshots.is_empty() {
-            return;
-        }
+        // Drained also with nothing pending: an image for a request that already timed out is
+        // dropped here instead of piling up.
         let taken = std::mem::take(&mut *self.taken_screenshots.lock().unwrap_or_else(PoisonError::into_inner));
         for (token, image) in taken {
             if let Some(i) = self.pending_screenshots.iter().position(|(t, ..)| *t == token) {
@@ -2105,10 +2106,18 @@ impl eframe::App for FilmcraftApp {
         }
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
-        } else if !self.input_waiters.is_empty() {
-            for w in self.input_waiters.drain(..) {
-                let _ = w.send(json!({"ok": true, "result": null}));
+        }
+        // Input is answered in `ui`, once a drawn pass has run it: a logic-only pass leaves the
+        // input for the next drawn one, so answering here would report input that has not run.
+        // When no pass has drawn for `NOT_DRAWN`, the window is hidden: answer with the reason,
+        // and drop the input not yet handed to egui so it does not run late.
+        if self.input_waiters.iter().any(|(_, drawn)| drawn.elapsed() >= control::NOT_DRAWN) {
+            self.synthetic.clear();
+            for (w, _) in self.input_waiters.drain(..) {
+                let _ = w.send(json!({"ok": false, "error": control::NOT_DRAWN_ERROR}));
             }
+        } else if !self.input_waiters.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let settled = !std::mem::take(&mut self.monitor_inexact) && self.timeline_still > 0;
         self.issue_screenshots(ctx, settled);
@@ -2145,9 +2154,13 @@ impl eframe::App for FilmcraftApp {
         self.ui_passes = self.ui_passes.wrapping_add(1);
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
+            let now = web_time::Instant::now();
+            for (_, drawn) in &mut self.input_waiters {
+                *drawn = now;
+            }
         } else if !self.input_waiters.is_empty() {
             ctx.request_repaint();
-            for w in self.input_waiters.drain(..) {
+            for (w, _) in self.input_waiters.drain(..) {
                 let _ = w.send(json!({"ok": true, "result": null}));
             }
         }

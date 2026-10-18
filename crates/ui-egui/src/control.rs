@@ -105,6 +105,29 @@ pub(crate) const NOT_DRAWN: std::time::Duration = std::time::Duration::from_secs
 pub(crate) const NOT_DRAWN_ERROR: &str = "the window is not being drawn (on another workspace or covered): \
 synthetic input and screenshots need it on screen; engine and inspect requests still work. The request was not run";
 
+/// What becomes of a request waiting for a drawn frame.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AwaitFrame {
+    /// A `ui` pass ran since it came in: it can go ahead.
+    Release,
+    /// None did within [`NOT_DRAWN`]: answer it with [`NOT_DRAWN_ERROR`].
+    NotDrawn,
+    Wait,
+}
+
+/// [`AwaitFrame`] for a request that came in at pass `passes_then` and has waited `waited`. The
+/// deadline is checked first, so a request whose time ran out is never run, even if a pass came
+/// in just after.
+pub(crate) fn await_frame(ui_passes: u64, passes_then: u64, waited: std::time::Duration) -> AwaitFrame {
+    if waited >= NOT_DRAWN {
+        AwaitFrame::NotDrawn
+    } else if ui_passes != passes_then {
+        AwaitFrame::Release
+    } else {
+        AwaitFrame::Wait
+    }
+}
+
 /// Requests that only complete in a drawn frame: synthetic input runs in `ui` passes and a
 /// screenshot needs a presented frame.
 pub(crate) fn needs_drawn_frame(method: &str) -> bool {
@@ -646,6 +669,17 @@ mod drawn_frame_tests {
         for m in ["engine.execute", "ui.inspect", "ui.elements", "ui.set", "app.quit", ""] {
             assert!(!super::needs_drawn_frame(m), "{m}");
         }
+    }
+
+    #[test]
+    fn a_request_waits_for_a_ui_pass_until_its_deadline() {
+        use super::{AwaitFrame, NOT_DRAWN, await_frame};
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(await_frame(5, 5, ms(10)), AwaitFrame::Wait, "no pass yet");
+        assert_eq!(await_frame(6, 5, ms(10)), AwaitFrame::Release, "a pass ran since it came in");
+        assert_eq!(await_frame(5, 5, NOT_DRAWN), AwaitFrame::NotDrawn, "none within the deadline");
+        // A pass that comes in after the deadline does not run it late (the deadline is checked first).
+        assert_eq!(await_frame(6, 5, NOT_DRAWN + ms(1)), AwaitFrame::NotDrawn);
     }
 }
 
