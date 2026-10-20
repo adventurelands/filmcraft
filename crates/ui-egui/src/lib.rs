@@ -300,11 +300,9 @@ pub struct FilmcraftApp {
     synthetic_modifiers: egui::Modifiers,
     /// Requests waiting for the UI to show an element: (request, give-up time).
     deferred: Vec<(ControlRequest, f64)>,
-    /// Input and screenshot requests waiting to see a `ui` pass: (request, when it came in,
-    /// `ui_passes` then).
-    awaiting_frame: Vec<(ControlRequest, web_time::Instant, u64)>,
-    /// `ui` passes so far, to tell whether one ran since a request came in.
-    ui_passes: u64,
+    /// Input and screenshot requests waiting to see a `ui` pass: (request, when it came in, how
+    /// long after that the first `ui` pass started).
+    awaiting_frame: Vec<(ControlRequest, web_time::Instant, Option<std::time::Duration>)>,
     last_ui_time: f64,
     pub(crate) synthetic: Vec<egui::Event>,
     /// macOS: a Control+Click already translated to a secondary (context) click, so its release is
@@ -569,7 +567,6 @@ impl FilmcraftApp {
             synthetic_modifiers: egui::Modifiers::NONE,
             deferred: Vec::new(),
             awaiting_frame: Vec::new(),
-            ui_passes: 0,
             last_ui_time: 0.0,
             synthetic: Vec::new(),
             mac_ctrl_click_armed: false,
@@ -1594,17 +1591,17 @@ impl FilmcraftApp {
         let Some(rx) = self.control_rx.take() else { return };
         let now = ctx.input(|i| i.time);
         let mut reqs: Vec<(ControlRequest, f64)> = std::mem::take(&mut self.deferred);
-        // Input and screenshots need a drawn frame: each goes ahead once a `ui` pass has run
-        // since it came in. A window the compositor isn't drawing (a Wayland window on another
+        // Input and screenshots need a drawn frame: each goes ahead once a `ui` pass has started
+        // within `NOT_DRAWN` of it coming in, however long that pass took. A window the compositor isn't drawing (a Wayland window on another
         // workspace or under a fullscreen one) runs only eframe's logic-only passes, so after
         // `NOT_DRAWN` without one the request is answered with why instead of timing out.
-        for (req, since, passes) in std::mem::take(&mut self.awaiting_frame) {
-            match control::await_frame(self.ui_passes, passes, since.elapsed()) {
+        for (req, since, first_pass) in std::mem::take(&mut self.awaiting_frame) {
+            match control::await_frame(first_pass, since.elapsed()) {
                 control::AwaitFrame::Release => reqs.push((req, now + 3.0)),
                 control::AwaitFrame::NotDrawn => {
                     let _ = req.reply.send(json!({"ok": false, "error": control::NOT_DRAWN_ERROR}));
                 }
-                control::AwaitFrame::Wait => self.awaiting_frame.push((req, since, passes)),
+                control::AwaitFrame::Wait => self.awaiting_frame.push((req, since, first_pass)),
             }
         }
         while let Ok(req) = rx.try_recv() {
@@ -1614,7 +1611,7 @@ impl FilmcraftApp {
                 self.raise_for_control(ctx);
             }
             if control::needs_drawn_frame(&req.method) {
-                self.awaiting_frame.push((req, web_time::Instant::now(), self.ui_passes));
+                self.awaiting_frame.push((req, web_time::Instant::now(), None));
             } else {
                 reqs.push((req, now + 3.0));
             }
@@ -2131,6 +2128,11 @@ impl eframe::App for FilmcraftApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // A drawn pass starts: requests waiting for one may go ahead, timed from now, before this
+        // pass's own work (see `control::await_frame`).
+        for (_, since, first_pass) in &mut self.awaiting_frame {
+            first_pass.get_or_insert_with(|| since.elapsed());
+        }
         if !self.fonts_ready {
             ui.ctx().request_repaint();
             return;
@@ -2151,7 +2153,6 @@ impl eframe::App for FilmcraftApp {
         }
         let ctx = ui.ctx().clone();
         self.last_ui_time = ctx.input(|i| i.time);
-        self.ui_passes = self.ui_passes.wrapping_add(1);
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
             let now = web_time::Instant::now();

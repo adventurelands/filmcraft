@@ -267,3 +267,23 @@ fn modified_control_drag_keeps_shift_until_release_and_clears_it_afterward() {
     d.frames(3, false);
     assert_eq!(d.h.ctx.input(|input| input.modifiers), Modifiers::NONE);
 }
+
+/// A visible window whose frame takes longer than the not-drawn limit (software rendering a large
+/// window, a heavy export) still runs control input: the limit times when a drawn pass starts, not
+/// how long it takes. Before, the next pass after a 1.2 s frame answered "not being drawn".
+#[test]
+fn input_after_a_slow_frame_still_runs() {
+    let mut d = Driver::new(false);
+    let (request, reply) = ControlRequest::new("ui.move", json!({"x": 700.0, "y": 450.0}));
+    d.tx.send(request).unwrap();
+    d.frames(1, true); // the request comes in and a drawn pass starts
+    std::thread::sleep(std::time::Duration::from_millis(1_200)); // that pass took 1.2 s
+    for _ in 0..60 {
+        d.frames(1, true);
+        if let Ok(result) = reply.try_recv() {
+            assert_eq!(result["ok"], true, "{result}");
+            return;
+        }
+    }
+    panic!("no control reply to ui.move");
+}
