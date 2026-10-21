@@ -1702,6 +1702,7 @@ dependencies = [
  "filmcraft-gpu",
  "filmcraft-platform",
  "filmcraft-project",
+ "filmcraft-pulse",
  "filmcraft-render",
  "filmcraft-time",
  "filmcraft-ui-egui",

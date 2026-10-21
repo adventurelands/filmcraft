@@ -93,6 +93,19 @@ pub trait AudioOut {
     /// dropped (a driver error, an unplugged device), keeping the clock and `fill`. A stream that
     /// cannot be restarted reports `played_frames() == None`.
     fn recover(&mut self) {}
+    /// Nothing is heard yet because the output is still starting, or reconnecting a stream its
+    /// server dropped: the clock holds still (the picture waits with it) and must not count as
+    /// stalled. The output bounds how long it reports this, then gives up on its own.
+    fn waiting(&self) -> bool {
+        false
+    }
+    /// `played_frames` counts frames already heard (a sound server's play position), not frames
+    /// handed to the device. The picture then times itself to when its frame reaches the screen,
+    /// one frame after it is drawn (see [`display_lead`]); a count of frames handed over already
+    /// runs ahead of the sound by the device's buffer.
+    fn clock_is_heard(&self) -> bool {
+        false
+    }
     /// Hosts and devices that can be chosen in Settings ▸ Audio Hardware.
     fn devices(&self) -> AudioDevices {
         AudioDevices::default()
@@ -252,6 +265,20 @@ pub struct Playback {
 /// #136); playback must not freeze on it. Devices that are slow to start (Bluetooth) stay well
 /// under this.
 pub const AUDIO_STALL_S: f64 = 1.0;
+
+/// The most [`display_lead`] puts the playhead ahead of the sound.
+pub const MAX_DISPLAY_LEAD_S: f64 = 0.05;
+
+/// How far ahead of the heard sound the playhead is drawn: a frame drawn now is on screen about one
+/// frame later, so with an output whose clock is the heard sound ([`AudioOut::clock_is_heard`])
+/// the playhead is taken at that moment. Zero for other outputs.
+pub(crate) fn display_lead(ctx: &egui::Context, audio: Option<&dyn AudioOut>) -> f64 {
+    if !audio.is_some_and(|a| a.clock_is_heard()) {
+        return 0.0;
+    }
+    let dt = f64::from(ctx.input(|i| i.stable_dt));
+    if dt.is_finite() { dt.clamp(0.0, MAX_DISPLAY_LEAD_S) } else { 0.0 }
+}
 
 /// How long `ui.screenshot` waits for the window to present the frame.
 const SCREENSHOT_TIMEOUT_S: f64 = 10.0;
@@ -1110,7 +1137,7 @@ impl FilmcraftApp {
             self.ui.status = tl!("Audio output failed: playing without sound (check Settings ▸ Audio Hardware)").into();
         }
         if let Some((f, sr)) = reading {
-            if f != self.playback.audio_seen.0 {
+            if f != self.playback.audio_seen.0 || self.audio.as_ref().is_some_and(|a| a.waiting()) {
                 self.playback.audio_seen = (f, now);
             } else if now - self.playback.audio_seen.1 >= AUDIO_STALL_S {
                 // the device stopped consuming samples: continue from where the audio got to on
@@ -1127,7 +1154,7 @@ impl FilmcraftApp {
             }
         }
         let elapsed = match reading {
-            Some((f, sr)) if self.playback.audio_clock && sr > 0 => f as f64 / sr as f64,
+            Some((f, sr)) if self.playback.audio_clock && sr > 0 => f as f64 / sr as f64 + display_lead(ctx, self.audio.as_deref()),
             _ => now - self.playback.anchor_time,
         };
         let t = self.playback.anchor_tick + Tick::from_seconds_f64(elapsed * self.playback.speed);
