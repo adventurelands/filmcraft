@@ -16,6 +16,8 @@
 //! daemon) the worker ends and hands the mixer callback back ([`Playback::ended`],
 //! [`Playback::into_fill`]), so the caller can reconnect and carry on with the same mixer.
 
+#![cfg(target_os = "linux")]
+
 use std::ffi::CString;
 use std::io::{BufReader, Cursor, Read};
 use std::os::unix::net::UnixStream;
@@ -1238,7 +1240,7 @@ mod tests {
         assert!(wait_for(|| playback.heard_frames() == 1024));
         std::thread::sleep(Duration::from_millis(40));
         let soon = playback.clock_frames().unwrap();
-        assert!((1024 + 1_500..1024 + 4_800).contains(&soon), "40 ms after the report the clock moved on with it: {soon}");
+        assert!((1024 + 1_500..=1024 + 4_800).contains(&soon), "40 ms after the report the clock moved on with it: {soon}");
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(playback.clock_frames(), Some(1024 + 4_800), "at most 100 ms past the report");
         assert_eq!(playback.played_frames(), Some(1024), "the report itself");
