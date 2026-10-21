@@ -294,6 +294,9 @@ pub struct SystemOut {
     active_pulse: bool,
     /// The sound server refused a stream or kept dropping it: use cpal until the settings change.
     pulse_refused: bool,
+    /// Set while cpal plays a mixer built for another rate (the server's): (mixer rate, cpal
+    /// rate). The clock is then counted at the mixer's rate.
+    resampled: Option<(u32, u32)>,
     /// Frames heard on the sound server before playback moved to cpal, so the clock goes on.
     cpal_base: u64,
 }
@@ -308,6 +311,7 @@ impl SystemOut {
             pulse_available,
             active_pulse: pulse_available,
             pulse_refused: false,
+            resampled: None,
             cpal_base: 0,
         }
     }
@@ -323,6 +327,74 @@ impl SystemOut {
     }
 }
 
+/// Start `out` with a mixer built for `mixer_rate`. An output that runs at another rate (cpal falls
+/// back to a device's default rate when the one asked for is unsupported) plays it resampled, so
+/// playback goes on instead of falling silent until the next start. Returns (mixer rate, output
+/// rate) when it resamples.
+fn hand_over(out: &mut dyn AudioOut, fill: pulse::Fill, mixer_rate: u32) -> Result<Option<(u32, u32)>, String> {
+    let out_rate = out.sample_rate();
+    if out_rate == mixer_rate || out_rate == 0 || mixer_rate == 0 {
+        out.start(fill)?;
+        return Ok(None);
+    }
+    log::info!("ALSA output at {out_rate} Hz plays the {mixer_rate} Hz mixer resampled");
+    out.start(resample(fill, mixer_rate, out_rate))?;
+    Ok(Some((mixer_rate, out_rate)))
+}
+
+/// `frames` at `from` Hz in frames at `to` Hz.
+fn rescale(frames: u64, from: u32, to: u32) -> u64 {
+    if from == 0 {
+        return frames;
+    }
+    u64::try_from(u128::from(frames) * u128::from(to) / u128::from(from)).unwrap_or(u64::MAX)
+}
+
+/// Frames the resampler pulls from its mixer at a time.
+const RESAMPLE_CHUNK: usize = 256;
+
+/// `fill`, made at `from` Hz, played at `to` Hz: each output frame interpolated linearly between
+/// the two mixer frames around it. Allocates only when the channel count grows.
+fn resample(mut fill: pulse::Fill, from: u32, to: u32) -> pulse::Fill {
+    let step = f64::from(from) / f64::from(to.max(1));
+    // the mixer's frames from `first` on, and the output's position in them
+    let mut src: Vec<f32> = Vec::new();
+    let mut first = 0u64;
+    let mut pos = 0f64;
+    let mut chunk: Vec<f32> = Vec::new();
+    let mut channels = 0usize;
+    Box::new(move |buf: &mut [f32], ch: usize| {
+        let ch = ch.max(1);
+        if ch != channels {
+            channels = ch;
+            src.clear();
+            first = pos.floor() as u64;
+            chunk.resize(RESAMPLE_CHUNK * ch, 0.0);
+            src.reserve((2 * RESAMPLE_CHUNK + 2) * ch);
+        }
+        for frame in buf.chunks_mut(ch) {
+            let at = pos.floor();
+            let i = (at as u64).saturating_sub(first) as usize;
+            // the two mixer frames around `pos`
+            while src.len() < (i + 2) * ch {
+                fill(&mut chunk, ch);
+                src.extend_from_slice(&chunk);
+            }
+            let t = (pos - at) as f32;
+            for (c, out) in frame.iter_mut().enumerate() {
+                let a = src.get(i * ch + c).copied().unwrap_or(0.0);
+                let b = src.get((i + 1) * ch + c).copied().unwrap_or(0.0);
+                *out = a + (b - a) * t;
+            }
+            pos += step;
+        }
+        // drop the frames the output has passed
+        let keep_from = ((pos.floor() as u64).saturating_sub(first) as usize).min(src.len() / ch);
+        src.drain(..keep_from * ch);
+        first += keep_from as u64;
+    })
+}
+
 impl AudioOut for SystemOut {
     fn start(&mut self, fill: Box<dyn FnMut(&mut [f32], usize) + Send>) -> Result<u32, String> {
         self.pulse.stop();
@@ -332,20 +404,27 @@ impl AudioOut for SystemOut {
         self.pulse_available = pulse::available();
         self.active_pulse = self.use_pulse();
         self.cpal_base = 0;
+        self.resampled = None;
         if self.active_pulse { self.pulse.start(fill) } else { self.cpal.start(fill) }
     }
     fn stop(&mut self) {
         self.pulse.stop();
         self.cpal.stop();
+        self.resampled = None;
     }
     fn sample_rate(&self) -> u32 {
-        self.active().sample_rate()
+        // the rate the playing mixer was built for, which the clock is counted at
+        self.resampled.map_or_else(|| self.active().sample_rate(), |(mixer, _)| mixer)
     }
     fn channels(&self) -> usize {
         self.active().channels()
     }
     fn played_frames(&self) -> Option<u64> {
-        if self.active_pulse { self.pulse.played_frames() } else { self.cpal.played_frames().map(|f| self.cpal_base.saturating_add(f)) }
+        if self.active_pulse {
+            self.pulse.played_frames()
+        } else {
+            self.cpal.played_frames().map(|f| self.cpal_base.saturating_add(self.resampled.map_or(f, |(mixer, cpal)| rescale(f, cpal, mixer))))
+        }
     }
     fn recover(&mut self) {
         if !self.active_pulse {
@@ -359,18 +438,14 @@ impl AudioOut for SystemOut {
             }
         };
         let Some((fill, heard)) = fallback else { return };
-        // cpal takes over with the same mixer, and the clock goes on from what was heard, if it
-        // runs at the rate the mixer was built for; otherwise the next playback starts on cpal.
+        // cpal takes over with the same mixer, and the clock goes on from what was heard
         self.pulse_refused = true;
         self.active_pulse = false;
         self.cpal_base = heard;
-        if self.cpal.sample_rate() != self.pulse.sample_rate() {
-            log::warn!("the sound server failed the audio stream; the next playback uses ALSA");
-            return;
-        }
         log::warn!("the sound server failed the audio stream; playing through ALSA");
-        if let Err(e) = self.cpal.start(fill) {
-            log::warn!("ALSA output: {e}");
+        match hand_over(&mut self.cpal, fill, self.pulse.sample_rate()) {
+            Ok(resampled) => self.resampled = resampled,
+            Err(e) => log::warn!("ALSA output: {e}"),
         }
     }
     fn note(&self) -> Option<String> {
@@ -422,6 +497,68 @@ mod tests {
         assert_eq!(r.check(t0 + ms(3000), false), Reconnect::GiveUp, "a server away for 3 s is given up");
     }
 
+    /// An output that keeps the callback it was started with, at a fixed rate.
+    struct Fixed {
+        rate: u32,
+        fill: Option<pulse::Fill>,
+    }
+
+    impl AudioOut for Fixed {
+        fn start(&mut self, fill: Box<dyn FnMut(&mut [f32], usize) + Send>) -> Result<u32, String> {
+            self.fill = Some(fill);
+            Ok(self.rate)
+        }
+        fn stop(&mut self) {
+            self.fill = None;
+        }
+        fn sample_rate(&self) -> u32 {
+            self.rate
+        }
+        fn played_frames(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    /// A mixer of a 48 kHz ramp: frame n of channel c is n + c / 10.
+    fn ramp() -> pulse::Fill {
+        let mut n = 0u64;
+        Box::new(move |buf: &mut [f32], ch: usize| {
+            for frame in buf.chunks_mut(ch) {
+                for (c, s) in frame.iter_mut().enumerate() {
+                    *s = n as f32 + c as f32 / 10.0;
+                }
+                n += 1;
+            }
+        })
+    }
+
+    /// FredApps: when ALSA could not run at the server's rate, the handover gave up and playback
+    /// went silent until restarted. It now plays the mixer resampled to the device's rate.
+    #[test]
+    fn the_alsa_handover_resamples_a_mixer_built_for_another_rate() {
+        let mut alsa = Fixed { rate: 44_100, fill: None };
+        assert_eq!(hand_over(&mut alsa, ramp(), 48_000), Ok(Some((48_000, 44_100))));
+        let mut fill = alsa.fill.take().expect("ALSA was started");
+        let mut buf = vec![0.0f32; 2 * 4_410];
+        fill(&mut buf, 2);
+        fill(&mut buf, 2); // a second callback goes on where the first stopped
+        // output frame j of the second callback is mixer frame (4410 + j) * 48000 / 44100
+        for j in [0usize, 1, 100, 4_409] {
+            let want = (4_410 + j) as f64 * 48_000.0 / 44_100.0;
+            let l = f64::from(buf[2 * j]);
+            assert!((l - want).abs() < 0.01, "frame {j}: {l} for {want}");
+            assert!((f64::from(buf[2 * j + 1]) - want - 0.1).abs() < 0.01, "the right channel stays the right channel");
+        }
+        // the same rate: the mixer as it is
+        let mut alsa = Fixed { rate: 48_000, fill: None };
+        assert_eq!(hand_over(&mut alsa, ramp(), 48_000), Ok(None));
+        let mut buf = vec![0.0f32; 4];
+        alsa.fill.as_mut().expect("started")(&mut buf, 2);
+        assert_eq!(buf, [0.0, 0.1, 1.0, 1.1]);
+        // the clock is counted at the mixer's rate: 1 s of 44.1 kHz frames is 1 s of 48 kHz ones
+        assert_eq!(rescale(44_100, 44_100, 48_000), 48_000);
+    }
+
     #[test]
     fn the_next_output_starts_its_clock_where_the_mixer_is() {
         // 48 000 frames from earlier streams; this one sent 9 600 of which 4 800 were heard when
@@ -460,6 +597,7 @@ mod tests {
             pulse_available: false,
             active_pulse: false,
             pulse_refused: false,
+            resampled: None,
             cpal_base: 0,
         };
         assert_eq!(out.note(), expected);
@@ -478,6 +616,7 @@ mod tests {
                 pulse_available: socket,
                 active_pulse: false,
                 pulse_refused: false,
+                resampled: None,
                 cpal_base: 0,
             }
             .use_pulse()
@@ -494,6 +633,7 @@ mod tests {
             pulse_available: true,
             active_pulse: false,
             pulse_refused: true,
+            resampled: None,
             cpal_base: 0,
         };
         assert!(!refused.use_pulse(), "after the server refused a stream, cpal until the settings change");
