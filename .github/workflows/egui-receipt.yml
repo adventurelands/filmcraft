@@ -1,0 +1,121 @@
+# Receipt for storytold/filmcraft#2376 (egui 0.37) on Linux (X11, and Wayland under a headless
+# weston), macOS and Windows: the gates the review asks for (fmt, clippy, the ui-egui and app
+# tests, layers, wasm), then main and the PR built and driven through the control channel by
+# .github/egui-receipt/receipt.py. The tables land in the run summary; logs and screenshots are
+# artifacts.
+name: egui-receipt
+on:
+  workflow_dispatch:
+  push:
+    branches: [egui-receipt]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  PYTHONIOENCODING: utf-8
+jobs:
+  receipt:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends \
+            build-essential clang cmake nasm pkg-config libasound2-dev libgtk-3-dev libudev-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            xvfb xdotool xclip openbox weston mesa-vulkan-drivers libgl1-mesa-dri libegl1 libegl-mesa0
+      - name: Rust 1.95
+        run: |
+          rustup toolchain install 1.95 --profile minimal --component clippy,rustfmt
+          rustup default 1.95
+          if [ "$RUNNER_OS" = Linux ]; then rustup target add wasm32-unknown-unknown; fi
+      - name: Which commits
+        run: |
+          git fetch -q https://github.com/storytold/filmcraft main
+          PR=$(git rev-parse HEAD~1)
+          MAIN=$(git merge-base "$PR" FETCH_HEAD)
+          echo "PR=$PR" >> "$GITHUB_ENV"; echo "MAIN=$MAIN" >> "$GITHUB_ENV"
+          echo "pr: $PR (head of #2376)"; echo "main: $MAIN (its merge base with storytold/main)"
+      - name: Gates on the PR head
+        run: |
+          set +e
+          git checkout -q "$PR" -- .
+          log="$RUNNER_TEMP/gates.md"; : > "$log"
+          gate() {  # gate <name> <command...>
+            start=$(date +%s); out=$("${@:2}" 2>&1); rc=$?; secs=$(( $(date +%s) - start ))
+            echo "$out" > "$RUNNER_TEMP/gate-$(echo "$1" | tr -c 'a-z0-9' '_').log"
+            sum=$(echo "$out" | grep -E "^test result:" | awk '{p+=$4; f+=$6; i+=$8} END {if (NR) printf "%d passed, %d failed, %d ignored", p, f, i}')
+            echo "| \`$1\` | $([ $rc = 0 ] && echo ✅ || echo "❌ rc=$rc") | ${sum:-} | ${secs} s |" | tee -a "$log"
+          }
+          if [ "$RUNNER_OS" = Linux ]; then gate "cargo fmt --all -- --check" cargo fmt --all -- --check; fi
+          gate "cargo clippy --workspace --all-targets --locked -- -D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
+          if [ "$RUNNER_OS" = Linux ]; then
+            Xvfb :98 -screen 0 1920x1080x24 >/dev/null 2>&1 & sleep 2
+            DISPLAY=:98 gate "cargo test -p filmcraft-ui-egui -p filmcraft --locked --no-fail-fast" cargo test -p filmcraft-ui-egui -p filmcraft --locked --no-fail-fast
+          else
+            gate "cargo test -p filmcraft-ui-egui -p filmcraft --locked --no-fail-fast" cargo test -p filmcraft-ui-egui -p filmcraft --locked --no-fail-fast
+          fi
+          gate "cargo xtask layers" cargo xtask layers
+          if [ "$RUNNER_OS" = Linux ]; then gate "cargo xtask wasm" cargo xtask wasm; fi
+          git checkout -q HEAD -- .
+          exit 0
+      - name: Build main and the PR
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=".exe"
+          build() {  # build <name> <ref>
+            rm -rf "$RUNNER_TEMP/src"; git worktree add -q --detach "$RUNNER_TEMP/src" "$2"
+            (cd "$RUNNER_TEMP/src" && CARGO_TARGET_DIR="$RUNNER_TEMP/target" cargo build -q --locked -p filmcraft)
+            cp "$RUNNER_TEMP/target/debug/filmcraft$ext" "$RUNNER_TEMP/bin/filmcraft-$1$ext"
+            echo "$1: $(git rev-parse "$2")" | tee -a "$RUNNER_TEMP/bin/builds.txt"
+            git worktree remove --force "$RUNNER_TEMP/src"
+          }
+          build main "$MAIN"
+          build pr "$PR"
+      - name: In-app checks
+        run: |
+          set +e
+          B="$RUNNER_TEMP/bin"; ext=""; [ "$RUNNER_OS" = Windows ] && ext=".exe"
+          py=python3; [ "$RUNNER_OS" = Windows ] && py=python
+          if [ "$RUNNER_OS" = Linux ]; then
+            Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 &
+            sleep 2
+            DISPLAY=:99 openbox >/dev/null 2>&1 &
+            sleep 1
+            DISPLAY=:99 WAYLAND_DISPLAY= LIBGL_ALWAYS_SOFTWARE=1 $py .github/egui-receipt/receipt.py "$RUNNER_TEMP/out-x11" main="$B/filmcraft-main" pr="$B/filmcraft-pr"
+            export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"; mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+            weston --backend=headless --renderer=gl --socket=wl-fc --width=1920 --height=1080 > "$RUNNER_TEMP/weston.log" 2>&1 &
+            sleep 3
+            WAYLAND_DISPLAY=wl-fc DISPLAY= LIBGL_ALWAYS_SOFTWARE=1 timeout 1200 $py .github/egui-receipt/receipt.py "$RUNNER_TEMP/out-wayland" main="$B/filmcraft-main" pr="$B/filmcraft-pr"
+            cp "$RUNNER_TEMP/weston.log" "$RUNNER_TEMP/out-wayland/" 2>/dev/null
+          else
+            $py .github/egui-receipt/receipt.py "$RUNNER_TEMP/out" main="$B/filmcraft-main$ext" pr="$B/filmcraft-pr$ext"
+            if [ "$RUNNER_OS" = macOS ]; then $py .github/egui-receipt/receipt.py "$RUNNER_TEMP/out-2" main="$B/filmcraft-main$ext" pr="$B/filmcraft-pr$ext"; fi
+          fi
+          {
+            echo "## $RUNNER_OS: #2376 receipt"; echo; sed 's/^/    /' "$B/builds.txt"; echo
+            echo "| Gate (PR head) | Result | Tests | Time |"; echo "|---|---|---|---|"; cat "$RUNNER_TEMP/gates.md"; echo
+            for d in "$RUNNER_TEMP"/out*; do echo "### $(basename "$d")"; echo; cat "$d/receipt.md" 2>/dev/null || echo "no receipt"; echo; done
+          } >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p "$RUNNER_TEMP/artifact"; cp -r "$RUNNER_TEMP"/out* "$RUNNER_TEMP"/gate*.log "$RUNNER_TEMP"/gates.md "$B/builds.txt" "$RUNNER_TEMP/artifact/" 2>/dev/null
+          exit 0
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: egui-receipt-${{ matrix.os }}
+          path: ${{ runner.temp }}/artifact
+          retention-days: 30
