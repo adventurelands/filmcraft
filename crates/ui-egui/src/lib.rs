@@ -1039,16 +1039,23 @@ impl FilmcraftApp {
     }
 
     pub fn stop(&mut self) {
+        // Scrubbing (the ruler, the monitors' scrub bars) calls this on every move to stop
+        // playback. With nothing playing, the output's only stream is the scrub's own: it stays
+        // open, rather than being closed and reopened on every move (a sound-server stream takes a
+        // moment to start, so each reopened one was cut off before it made a sound).
+        let only_scrubbing = !self.playback.playing && self.playback.preroll.is_none() && self.scrub.is_open();
         self.playback.playing = false;
         self.playback.stop_at = None;
         self.playback.rest_at = None;
         self.playback.preroll = None;
         self.playback.meter.finish();
         self.frames.stop_prefetch();
-        if let Some(a) = self.audio.as_mut() {
-            a.stop();
+        if !only_scrubbing {
+            if let Some(a) = self.audio.as_mut() {
+                a.stop();
+            }
+            self.scrub.device_stopped();
         }
-        self.scrub.device_stopped();
         self.playback.audio_clock = false;
         if self.session.mixrec.active() {
             let t = self.session.playhead();
