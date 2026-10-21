@@ -1,0 +1,5 @@
+# The second PulseAudio, reached only through ALSA's default device: where cpal's sound goes.
+.fail
+load-module module-native-protocol-unix
+load-module module-null-sink sink_name=fc_alsa sink_properties=device.description=ALSA-side-fc_alsa
+set-default-sink fc_alsa

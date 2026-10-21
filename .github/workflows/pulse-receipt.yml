@@ -1,0 +1,82 @@
+# Receipt for storytold/filmcraft#2407: FilmCraft's audio on real sound servers, the stock
+# PulseAudio of Ubuntu 22.04 and the PipeWire (pipewire + wireplumber + pipewire-pulse) of Ubuntu
+# 24.04. Builds main, the PR's head as reviewed and the PR with the review's fixes, and runs each
+# through .github/pulse-receipt/receipt.py: playback and its speed, picture vs sound (also after
+# pauses and seeks), scrubbing, a chosen output, a server restart, a 5.1 sink, a refused stream, a
+# server killed mid-play, no server at all, and PULSE_SERVER naming another socket or a TCP server.
+# The tables land in the run summary; recordings and logs are artifacts.
+name: pulse-receipt
+on:
+  workflow_dispatch:
+  push:
+    branches: [pulse-receipt]
+permissions:
+  contents: read
+jobs:
+  receipt:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - server: pulseaudio
+            os: ubuntu-22.04
+            packages: pulseaudio pulseaudio-utils libasound2-plugins
+          - server: pipewire
+            os: ubuntu-24.04
+            packages: pipewire pipewire-pulse pipewire-alsa wireplumber pulseaudio-utils pipewire-bin dbus-x11
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      MAIN: 6c3948a36c80e4996d924766ba7157eec4fca85e      # main, the PR's base
+      REVIEWED: 40ab919fd0c17beab44d9889c5cd2e9a4019c2d4  # the PR head FredApps re-reviewed
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      FC_SERVER: ${{ matrix.server }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends \
+            build-essential clang cmake nasm pkg-config libasound2-dev libgtk-3-dev libudev-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            ${{ matrix.packages }} sox xvfb dbus \
+            mesa-vulkan-drivers libgl1-mesa-dri libegl1
+          if [ "$FC_SERVER" = pipewire ]; then pipewire --version; else pulseaudio --version; fi
+      - name: Rust 1.95
+        run: rustup toolchain install 1.95 --profile minimal && rustup default 1.95
+      - name: Build main, the reviewed PR and the fixed PR
+        run: |
+          git fetch -q https://github.com/storytold/filmcraft "$MAIN"
+          git fetch -q https://github.com/adventurelands/filmcraft "$REVIEWED" || true
+          mkdir -p "$RUNNER_TEMP/bin"
+          build() {  # build <name> <ref>
+            rm -rf "$RUNNER_TEMP/src"; git worktree add -q --detach "$RUNNER_TEMP/src" "$2"
+            (cd "$RUNNER_TEMP/src" && CARGO_TARGET_DIR="$RUNNER_TEMP/target" cargo build -q --locked -p filmcraft)
+            cp "$RUNNER_TEMP/target/debug/filmcraft" "$RUNNER_TEMP/bin/filmcraft-$1"
+            echo "$1: $(git rev-parse "$2")" | tee -a "$RUNNER_TEMP/bin/builds.txt"
+            git worktree remove --force "$RUNNER_TEMP/src"
+          }
+          build main "$MAIN"
+          build reviewed "$REVIEWED"
+          build fixed HEAD~1
+      - name: Receipt
+        run: |
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"; mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+          Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 &
+          export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1; unset WAYLAND_DISPLAY
+          sleep 2
+          B="$RUNNER_TEMP/bin"
+          if [ "$FC_SERVER" = pipewire ]; then run="dbus-run-session --"; else run=""; fi
+          $run python3 .github/pulse-receipt/receipt.py "$RUNNER_TEMP/out" main="$B/filmcraft-main" reviewed="$B/filmcraft-reviewed" fixed="$B/filmcraft-fixed"
+          { echo "## FilmCraft audio on $FC_SERVER"; echo; sed 's/^/    /' "$B/builds.txt"; echo; cat "$RUNNER_TEMP/out/receipt.md"; } >> "$GITHUB_STEP_SUMMARY"
+          cp "$B/builds.txt" "$RUNNER_TEMP/out/"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulse-receipt-${{ matrix.server }}
+          path: ${{ runner.temp }}/out
+          retention-days: 30

@@ -1,0 +1,6 @@
+# The receipt's PulseAudio: the stock daemon with two null sinks and the native protocol.
+.fail
+load-module module-native-protocol-unix
+load-module module-null-sink sink_name=fc_null sink_properties=device.description=Speakers-fc_null
+load-module module-null-sink sink_name=fc_alt sink_properties=device.description=Headphones-fc_alt
+set-default-sink fc_null

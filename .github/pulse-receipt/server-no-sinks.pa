@@ -1,0 +1,3 @@
+# The receipt's PulseAudio with no sink at all (and no module-always-sink): streams are refused.
+.fail
+load-module module-native-protocol-unix

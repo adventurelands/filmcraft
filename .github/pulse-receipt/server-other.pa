@@ -1,0 +1,6 @@
+# A second PulseAudio, named only through PULSE_SERVER: its own Unix socket, TCP on 127.0.0.1:4713.
+.fail
+load-module module-native-protocol-unix socket=/tmp/fc-other-server/native
+load-module module-native-protocol-tcp auth-anonymous=1 listen=127.0.0.1 port=4713
+load-module module-null-sink sink_name=fc_other sink_properties=device.description=Other-fc_other
+set-default-sink fc_other
